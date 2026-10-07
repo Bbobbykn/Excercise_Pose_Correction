@@ -6,7 +6,8 @@ import mediapipe as mp
 from collections import deque
 
 # Load YOLO model
-model = YOLO('C:/Users/narji/Desktop/best/best.pt').to('cuda')
+import os, torch
+model = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'best.pt')).to('mps' if torch.backends.mps.is_available() else 'cpu')
 
 # Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
