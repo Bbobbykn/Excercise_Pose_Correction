@@ -5,14 +5,26 @@ from ultralytics import YOLO
 import mediapipe as mp
 from collections import deque
 
-# Load YOLO model
-import os, torch
-model = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'best.pt')).to('mps' if torch.backends.mps.is_available() else 'cpu')
+import os, tempfile, torch
 
-# Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.7, min_tracking_confidence=0.7)
 mp_drawing = mp.solutions.drawing_utils
+
+
+# Load models once per server process; Streamlit reruns this script on every interaction
+@st.cache_resource
+def load_model():
+    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    return YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'best.pt')).to(device)
+
+
+@st.cache_resource
+def load_pose():
+    return mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+
+
+model = load_model()
+pose = load_pose()
 
 # Initialize buffers for angles and elbow positions
 angle_buffer = deque(maxlen=10)
@@ -189,28 +201,39 @@ def check_squat_form(landmarks, frame):
 # Streamlit App
 st.title("Real-Time Exercise Feedback")
 st.sidebar.title("Settings")
-video_source = st.sidebar.selectbox("Select Video Source", ("DroidCam USB", "Webcam", "Upload Video"))
+video_source = st.sidebar.selectbox("Select Video Source", ("Upload Video", "Webcam", "DroidCam USB"))
+uploaded_file = None
 if video_source == "DroidCam USB":
     st.sidebar.write("Ensure DroidCam is running and connected via USB.")
-    cap = cv2.VideoCapture(1)
 elif video_source == "Webcam":
-    cap = cv2.VideoCapture(0)
+    st.sidebar.write("Webcam only works when running the app on your own computer.")
 elif video_source == "Upload Video":
-    uploaded_file = st.sidebar.file_uploader("Upload a Video", type=["mp4", "avi"])
-    if uploaded_file:
-        temp_file = "temp_video.mp4"
-        with open(temp_file, "wb") as f:
-            f.write(uploaded_file.read())
-        cap = cv2.VideoCapture(temp_file)
+    uploaded_file = st.sidebar.file_uploader("Upload a Video", type=["mp4", "avi", "mov"])
+
+MAX_WIDTH = 640
 
 if st.sidebar.button("Start"):
-    if 'cap' in locals() and cap and cap.isOpened():
+    # Open the source only when Start is pressed so idle reruns don't grab the camera
+    cap = None
+    if video_source == "DroidCam USB":
+        cap = cv2.VideoCapture(1)
+    elif video_source == "Webcam":
+        cap = cv2.VideoCapture(0)
+    elif uploaded_file is not None:
+        temp_file = os.path.join(tempfile.gettempdir(), "pose_upload_" + uploaded_file.name)
+        with open(temp_file, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        cap = cv2.VideoCapture(temp_file)
+    if cap is not None and cap.isOpened():
         st_frame = st.empty()
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            results = model(frame)
+            if frame.shape[1] > MAX_WIDTH:
+                scale = MAX_WIDTH / frame.shape[1]
+                frame = cv2.resize(frame, (MAX_WIDTH, int(frame.shape[0] * scale)))
+            results = model(frame, verbose=False)
             if len(results[0].boxes):
                 sorted_boxes = sorted(results[0].boxes, key=lambda x: x.conf, reverse=True)
                 class_id = int(sorted_boxes[0].cls)
@@ -280,7 +303,13 @@ if st.sidebar.button("Start"):
             cv2.putText(frame, f"Exercise: {exercise_type}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             color = (0, 255, 0) if "Good Form" in feedback else (0, 0, 255)
             cv2.putText(frame, feedback, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            st_frame.image(frame, channels="BGR", use_column_width=True)
+            st_frame.image(frame, channels="BGR", width="stretch")
         cap.release()
     else:
-        st.error("No video source selected or invalid file!")
+        if cap is not None:
+            cap.release()
+        if video_source == "Upload Video":
+            st.error("Upload a video first, then press Start.")
+        else:
+            st.error("Couldn't open the camera. On the online version use Upload Video; "
+                     "locally, allow camera access for Terminal in System Settings.")
